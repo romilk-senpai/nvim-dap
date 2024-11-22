@@ -398,8 +398,9 @@ local function set_cursor(win, line, column)
     end)
   else
     local msg = string.format(
-      "Debug adapter reported a frame at line %s column %s, but: %s. "
+      "Adapter reported a frame in buf %d line %s column %s, but: %s. "
       .. "Ensure executable is up2date and if using a source mapping ensure it is correct",
+      api.nvim_win_get_buf(win),
       line,
       column,
       err
@@ -656,7 +657,8 @@ function Session:update_threads(cb)
       threads[thread.id] = thread
       local old_thread = self.threads[thread.id]
       if old_thread then
-        thread.stopped = old_thread.stopped
+        local stopped = old_thread.stopped == nil and false or old_thread.stopped
+        thread.stopped = stopped
         thread.frames = old_thread.frames
       end
     end
@@ -688,10 +690,22 @@ function Session:event_stopped(stopped)
     local co = coroutine.running()
 
     if self.dirty.threads or (stopped.threadId and self.threads[stopped.threadId] == nil) then
+      local thread = {
+        id = stopped.threadId,
+        name = "Unknown",
+        stopped = true
+      }
+      if thread.id then
+        self.threads[thread.id] = thread
+      end
       self:update_threads(coresume(co))
       local err = coroutine.yield()
       if err then
         utils.notify('Error retrieving threads: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+        return
+      end
+      if thread.stopped == false then
+        log.debug("Thread resumed during stopped event handling", stopped, thread)
         return
       end
     end
@@ -745,6 +759,10 @@ function Session:event_stopped(stopped)
       threadId = stopped.threadId
     }
     local err, response = self:request('stackTrace', params)
+    if thread.stopped == false then
+      log.debug("Debug adapter resumed during stopped event handling", thread, err)
+      return
+    end
     if err then
       utils.notify('Error retrieving stack traces: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
       return
@@ -1956,7 +1974,13 @@ function Session:event_continued(event)
     for _, t in pairs(self.threads) do
       t.stopped = false
     end
+    self.stopped_thread_id = nil
+    vim.fn.sign_unplace(self.sign_group)
   else
+    if self.stopped_thread_id == event.threadId then
+      self.stopped_thread_id = nil
+      vim.fn.sign_unplace(self.sign_group)
+    end
     local thread = self.threads[event.threadId]
     if thread and thread.stopped then
       thread.stopped = false
