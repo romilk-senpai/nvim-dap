@@ -563,6 +563,9 @@ The configuration values are set via `dap.defaults.fallback` (for global) or
   the integrated terminal. (See |dap-terminal|). Either a string or a function
   that must return a buffer number and a window number of the buffer/window
   for the terminal.
+  When using a function, it receives the current debug configuration as an 
+  argument, allowing for dynamic terminal naming and setup based on the 
+  session's configuration.
 
   Note that extensions like `nvim-dap-ui` use this to control the UI.
   If you customize it, you may break their behavior.
@@ -602,6 +605,10 @@ The configuration values are set via `dap.defaults.fallback` (for global) or
   dap.defaults.fallback.on_output = function(session, output_event)
     -- ignore all outputs
   end
+
+
+- `autostart`. Name of a configuration to start implicitly if evaluating an
+  expression in the REPL without active session.
 <
 
 Some more examples:
@@ -613,6 +620,8 @@ Some more examples:
   dap.defaults.python.terminal_win_cmd = 'belowright new'
 
   dap.defaults.java.auto_continue_if_many_stopped = false
+
+  dap.defaults.fallback.autostart = "nluarepl"
 <
 
 ==============================================================================
@@ -731,24 +740,41 @@ restart({config})                                                *dap.restart()*
           configuration used to start the current session.
 
 
-terminate(terminate_opts, disconnect_opts, cb),                                           *dap.terminate()*
+terminate(opts),                                              *dap.terminate()*
         Terminates the debug session.
 
         If the debug adapter doesn't support the `terminateRequest`
         capability, this will instead call |dap.disconnect()| with
         `terminateDebugee = true`.
 
+        If disconnect is used, the `terminateDebugee` and `suspendDebugee`
+        options will only take effect if the debug adapter has the
+        corresponding capabilities.
+
         Parameters: ~
-            {terminate_opts}      Options for the `terminate` request.
-                                  Defaults to empty.
-                                  Not used if |dap.disconnect| is used.
+            {opts}  Table containing:
 
-            {disconnect_opts}     Opts for |dap.disconnect|
-                                  Defaults to `{ terminateDebuggee = true }`
+                     - `terminate_args`: table; used if terminate is supported:
+                       - `restart: boolean?
 
-            {cb}                  Callback that is invoked once the session
-                                  terminated or immediately if no session is
-                                  active.
+                     - `disconnect_args`: table; used if terminate is not
+                       supported:
+                       - `restart`: `boolean?`
+                       - `terminateDebugee`: `boolean?`
+                       - `suspendDebugee`: `boolean?`
+
+                     - `on_done`: function triggered once terminate or
+                       disconnect completes
+
+                     - `all`: `boolean`: flag indicating that all root sessions
+                       should be terminated instead of only the currently
+                       focused session. Defaults to false
+
+                     - `hierarchy`: `boolean`: flag indicating that child and
+                       parent sessions should be terminated. This will affect
+                       the current focused session unless combined with `all`,
+                       in that case it terminates all root sessions including
+                       all their children.
 
 
 set_breakpoint({condition}, {hit_condition}, {log_message})

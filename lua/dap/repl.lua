@@ -23,9 +23,11 @@ local function new_buf()
   local prev_buf = api.nvim_get_current_buf()
   local buf = api.nvim_create_buf(true, true)
   api.nvim_buf_set_name(buf, string.format('[dap-repl-%d]', buf))
+  vim.b[buf]["dap-srcft"] = vim.bo[prev_buf].filetype
   vim.bo[buf].buftype = "prompt"
   vim.bo[buf].omnifunc = "v:lua.require'dap.repl'.omnifunc"
   vim.bo[buf].buflisted = false
+  vim.bo[buf].tagfunc = "v:lua.require'dap'._tagfunc"
   local path = vim.bo[prev_buf].path
   if path and path ~= "" then
     vim.bo[buf].path = path
@@ -34,6 +36,12 @@ local function new_buf()
   api.nvim_buf_set_keymap(buf, 'n', 'o', "<Cmd>lua require('dap.ui').trigger_actions()<CR>", {})
   api.nvim_buf_set_keymap(buf, 'i', '<up>', "<Cmd>lua require('dap.repl').on_up()<CR>", {})
   api.nvim_buf_set_keymap(buf, 'i', '<down>', "<Cmd>lua require('dap.repl').on_down()<CR>", {})
+  api.nvim_create_autocmd("TextYankPost", {
+    buffer = buf,
+    callback = function()
+      require("dap._cmds").yank_evalname()
+    end,
+  })
   vim.fn.prompt_setprompt(buf, 'dap> ')
   vim.fn.prompt_setcallback(buf, execute)
   if vim.fn.has('nvim-0.7') == 1 then
@@ -64,6 +72,10 @@ local function new_win(buf, winopts, wincmd)
   local win = api.nvim_get_current_win()
   api.nvim_win_set_buf(win, buf)
   if vim.fn.has("nvim-0.11") == 1 then
+    vim.wo[win][0].relativenumber = false
+    vim.wo[win][0].number = false
+    vim.wo[win][0].foldcolumn = "0"
+    vim.wo[win][0].signcolumn = "auto"
     vim.wo[win][0].wrap = false
   else
     vim.wo[win].wrap = false
@@ -217,45 +229,40 @@ local function print_threads(threads)
 end
 
 
-function execute(text)
-  if text == '' then
-    if history.last then
-      text = history.last
-    else
+---@param confname string
+---@return dap.Session?
+local function trystart(confname)
+  assert(coroutine.running() ~= nil, "Must run in coroutine")
+  local dap = require("dap")
+  local bufnr = api.nvim_get_current_buf()
+  for _, get_configs in pairs(dap.providers.configs) do
+    local configs = get_configs(bufnr)
+    for _, config in ipairs(configs) do
+      if confname == config.name then
+        dap.run(config)
+      end
+    end
+  end
+  return dap.session()
+end
+
+
+local function coexecute(text)
+  assert(coroutine.running() ~= nil, "Must run in coroutine")
+
+  local session = get_session()
+  if not session then
+    local ft = vim.b["dap-srcft"] or vim.bo.filetype
+    local autostart = require("dap").defaults[ft].autostart
+    if autostart then
+      session = trystart(autostart)
+    end
+    if not session then
+      M.append('No active debug session')
       return
     end
-  else
-    history.last = text
-    if #history.entries == history.max_size then
-      table.remove(history.entries, 1)
-    end
-    table.insert(history.entries, text)
-    history.idx = #history.entries + 1
   end
-
-  local splitted_text = vim.split(text, ' ')
-  local session = get_session()
-  if vim.tbl_contains(M.commands.exit, text) then
-    if session then
-      -- Should result in a `terminated` event which closes the session and sets it to nil
-      session:disconnect()
-    end
-    api.nvim_command('close')
-    return
-  end
-  if vim.tbl_contains(M.commands.help, text) then
-    print_commands()
-    return
-  elseif vim.tbl_contains(M.commands.clear, text) then
-    if repl.buf and api.nvim_buf_is_loaded(repl.buf) then
-      M.clear()
-    end
-    return
-  end
-  if not session then
-    M.append('No active debug session')
-    return
-  end
+  local words = vim.split(text, ' ', { plain = true })
   if vim.tbl_contains(M.commands.continue, text) then
     require('dap').continue()
   elseif vim.tbl_contains(M.commands.next_, text) then
@@ -280,9 +287,9 @@ function execute(text)
   elseif vim.tbl_contains(M.commands.down, text) then
     session:_frame_delta(-1)
     M.print_stackframes()
-  elseif vim.tbl_contains(M.commands.goto_, splitted_text[1]) then
-    if splitted_text[2] then
-      session:_goto(tonumber(splitted_text[2]))
+  elseif vim.tbl_contains(M.commands.goto_, words[1]) then
+    if words[2] then
+      session:_goto(tonumber(words[2]))
     end
   elseif vim.tbl_contains(M.commands.scopes, text) then
     print_scopes(session.current_frame)
@@ -290,12 +297,50 @@ function execute(text)
     print_threads(vim.tbl_values(session.threads))
   elseif vim.tbl_contains(M.commands.frames, text) then
     M.print_stackframes()
-  elseif M.commands.custom_commands[splitted_text[1]] then
-    local command = splitted_text[1]
+  elseif M.commands.custom_commands[words[1]] then
+    local command = words[1]
     local args = string.sub(text, string.len(command)+2)
     M.commands.custom_commands[command](args)
   else
     session:evaluate(text, evaluate_handler)
+  end
+end
+
+
+function execute(text)
+  if text == '' then
+    if history.last then
+      text = history.last
+    else
+      return
+    end
+  else
+    history.last = text
+    if #history.entries == history.max_size then
+      table.remove(history.entries, 1)
+    end
+    table.insert(history.entries, text)
+    history.idx = #history.entries + 1
+  end
+  if vim.tbl_contains(M.commands.exit, text) then
+    local session = get_session()
+    if session then
+      -- Should result in a `terminated` event which closes the session and sets it to nil
+      session:disconnect()
+    end
+    api.nvim_command('close')
+    return
+  end
+  if vim.tbl_contains(M.commands.help, text) then
+    print_commands()
+  elseif vim.tbl_contains(M.commands.clear, text) then
+    if repl.buf and api.nvim_buf_is_loaded(repl.buf) then
+      M.clear()
+    end
+  else
+    require("dap.async").run(function()
+      coexecute(text)
+    end)
   end
 end
 
@@ -493,19 +538,22 @@ do
       text = line_to_cursor,
       column = col + 1 - offset
     }
-    session:request('completions', args, function(err, response)
+    ---@param err dap.ErrorResponse?
+    ---@param response dap.CompletionsResponse?
+    local function on_response(err, response)
       if err then
         require('dap.utils').notify('completions request failed: ' .. err.message, vim.log.levels.WARN)
-        return
+      elseif response then
+        local items = response.targets
+        local mixed, start = get_start(items)
+        if start and not mixed then
+          vim.fn.complete(offset + start + 1, completions_to_items(items))
+        else
+          vim.fn.complete(offset + text_match + 1, completions_to_items(items))
+        end
       end
-      local items = response.targets --[[@as dap.CompletionItem[]|]]
-      local mixed, start = get_start(items)
-      if start and not mixed then
-        vim.fn.complete(offset + start + 1, completions_to_items(items))
-      else
-        vim.fn.complete(offset + text_match + 1, completions_to_items(items))
-      end
-    end)
+    end
+    session:request('completions', args, on_response)
 
     -- cancel but stay in completion mode for completion via `completions` callback
     return -2

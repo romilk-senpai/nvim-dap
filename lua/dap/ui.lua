@@ -4,8 +4,12 @@ local if_nil = utils.if_nil
 local M = {}
 
 
+---@param win integer
+---@param opts table<string, any>?
 function M.apply_winopts(win, opts)
-  if not opts then return end
+  if not opts then
+    return
+  end
   assert(
     type(opts) == 'table',
     'winopts must be a table, not ' .. type(opts) .. ': ' .. vim.inspect(opts)
@@ -316,11 +320,9 @@ function M.new_view(new_buf, new_win, opts)
       local win = self.win
       local buf = self.buf
       if win and api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == buf then
-        local win_tabpage = api.nvim_win_get_tabpage(win)
-        local current_tabpage = api.nvim_get_current_tabpage()
         api.nvim_win_close(win, true)
         self.win = nil
-        closed = win_tabpage == current_tabpage
+        closed = true
       end
       local hide = close_opts.mode == 'toggle'
       if buf and not hide then
@@ -416,6 +418,9 @@ end
 ---@type table<number, dap.ui.Layer>
 local layers = {}
 
+--- Return an existing layer
+---
+---@param buf integer
 ---@return nil|dap.ui.Layer
 function M.get_layer(buf)
   return layers[buf]
@@ -426,6 +431,8 @@ end
 ---@field item any
 ---@field context table|nil
 
+--- Returns a layer, creating it if it's missing.
+---@param buf integer
 ---@return dap.ui.Layer
 function M.layer(buf)
   assert(buf, 'Need a buffer to operate on')

@@ -150,7 +150,7 @@ M.defaults = setmetatable(
       ---@type "statement"|"line"|"instruction"
       stepping_granularity = 'statement';
 
-      ---@type string|fun(): number bufnr, number|nil win
+      ---@type string|fun(config: dap.Configuration):(integer, integer?)
       terminal_win_cmd = 'belowright new';
       focus_terminal = false;
       auto_continue_if_many_stopped = true;
@@ -226,7 +226,7 @@ local DAP_QUICKFIX_CONTEXT = DAP_QUICKFIX_TITLE
 ---@field detached nil|boolean
 
 
----@alias Dap.AdapterFactory fun(callback: fun(adapter: dap.Adapter), config: dap.Configuration, parent?: dap.Session)
+---@alias dap.AdapterFactory fun(callback: fun(adapter: dap.Adapter), config: dap.Configuration, parent?: dap.Session)
 
 --- Adapter definitions. See `:help dap-adapter` for more help
 ---
@@ -241,7 +241,7 @@ local DAP_QUICKFIX_CONTEXT = DAP_QUICKFIX_TITLE
 ---   },
 --- }
 --- ```
----@type table<string, dap.Adapter|Dap.AdapterFactory>
+---@type table<string, dap.Adapter|dap.AdapterFactory>
 M.adapters = {}
 
 
@@ -591,10 +591,10 @@ function M.run(config, opts)
     end
     local adapter = M.adapters[config.type]
     if type(adapter) == 'table' then
-      lazy.progress.report('Launching debug adapter')
+      lazy.progress.report('Starting adapter ' .. config.type)
       maybe_enrich_config_and_run(adapter, config, opts)
     elseif type(adapter) == 'function' then
-      lazy.progress.report('Launching debug adapter')
+      lazy.progress.report('Starting adapter ' .. config.type)
       adapter(
         function(resolved_adapter)
           maybe_enrich_config_and_run(resolved_adapter, config, opts)
@@ -747,11 +747,14 @@ function M.stop()
 end
 
 
-local function terminate(lsession, terminate_opts, disconnect_opts, cb)
-  cb = cb or function() end
+---@param lsession dap.Session?
+---@param opts dap.terminate.Opts?
+local function terminate(lsession, opts)
+  opts = opts or {}
+  local on_done = opts.on_done or function() end
   if not lsession then
     notify('No active session')
-    cb()
+    on_done()
     return
   end
 
@@ -759,16 +762,16 @@ local function terminate(lsession, terminate_opts, disconnect_opts, cb)
     log().warn('User called terminate on already closed session that is still in use')
     sessions[lsession.id] = nil
     M.set_session(nil)
-    cb()
+    on_done()
     return
   end
   local capabilities = lsession.capabilities or {}
   if capabilities.supportsTerminateRequest then
     capabilities.supportsTerminateRequest = false
-    local opts = terminate_opts or vim.empty_dict()
+    local args = opts.terminate_args or vim.empty_dict()
     local timeout_sec = (lsession.adapter.options or {}).disconnect_timeout_sec or 3
     local timeout_ms = timeout_sec * 1000
-    lsession:request_with_timeout('terminate', opts, timeout_ms, function(err)
+    lsession:request_with_timeout('terminate', args, timeout_ms, function(err)
       if err then
         log().warn(lazy.utils.fmt_error(err))
       end
@@ -776,25 +779,78 @@ local function terminate(lsession, terminate_opts, disconnect_opts, cb)
         lsession:close()
       end
       notify('Session terminated')
-      cb()
+      on_done()
     end)
   else
-    local opts = disconnect_opts or { terminateDebuggee = true }
-    lsession:disconnect(opts, cb)
+    local args = opts.disconnect_args or { terminateDebuggee = true }
+    lsession:disconnect(args, on_done)
   end
 end
 
+---@class dap.terminate.Opts
+---@field terminate_args dap.TerminateArguments?
+---@field disconnect_args dap.DisconnectArguments?
+---@field on_done function?
+---@field hierarchy boolean? terminate full hierarchy. Defaults to false
+---@field all boolean? terminate all root sessions. Can be combined with hierarchy. Defaults to false
 
-function M.terminate(terminate_opts, disconnect_opts, cb)
-  local lsession = session
-  if not lsession then
-    local _, s = next(sessions)
-    if s then
-      log().info("Terminate called without active session, switched to", s.id)
-    end
-    lsession = s
+
+---@param opts dap.terminate.Opts?
+function M.terminate(opts, disconnect_opts, cb)
+  opts = opts or {}
+  -- old signature was:
+  --- - terminate_opts dap.TerminateArguments?
+  --- - disconnect_opts dap.DisconnectArguments?
+  --- - cb fun()?
+  ---@diagnostic disable-next-line: undefined-field
+  if opts.restart ~= nil or disconnect_opts ~= nil or cb ~= nil then
+    opts = {
+      ---@diagnostic disable-next-line: assign-type-mismatch
+      terminate_args = opts,
+      disconnect_args = disconnect_opts,
+      on_done = cb,
+      hierarchy = false,
+      all = false,
+    }
   end
-  terminate(lsession, terminate_opts, disconnect_opts, cb)
+
+  local hierarchy = lazy.utils.if_nil(opts.hierarchy, false)
+  local all = lazy.utils.if_nil(opts.all, false)
+
+  ---@param s dap.Session
+  local function rec_terminate(s)
+    terminate(s, opts)
+    if hierarchy then
+      for _, child in pairs(s.children) do
+        rec_terminate(child)
+      end
+    end
+  end
+
+  if all then
+    for _, s in pairs(sessions) do
+      rec_terminate(s)
+    end
+  else
+    local lsession = session
+    if not lsession then
+      local _, s = next(sessions)
+      if s then
+        log().info("Terminate called without active session, switched to", s.id)
+      end
+      lsession = s
+    end
+    if not lsession then
+      return
+    end
+    if hierarchy then
+      while lsession.parent ~= nil do
+        lsession = lsession.parent
+        assert(lsession)
+      end
+    end
+    rec_terminate(lsession)
+  end
 end
 
 
@@ -854,11 +910,14 @@ function M.restart(config, opts)
       end)
     end)
   else
-    terminate(lsession, nil, nil, vim.schedule_wrap(function()
-      local nopts = opts and vim.deepcopy(opts) or {}
-      nopts.new = true
-      M.run(config, nopts)
-    end))
+    local terminate_opts = {
+      on_done = vim.schedule_wrap(function()
+        local nopts = opts and vim.deepcopy(opts) or {}
+        nopts.new = true
+        M.run(config, nopts)
+      end)
+    }
+    terminate(lsession, terminate_opts)
   end
 end
 
@@ -1194,19 +1253,78 @@ function M.set_session(new_session)
 end
 
 
+function M._tagfunc(_, flags, _)
+  local lsession = session
+  if not lsession then
+    return vim.NIL
+  end
+  if not flags:match("c") then
+    return vim.NIL
+  end
+  local ui = require("dap.ui")
+  local buf = api.nvim_get_current_buf()
+  local layer = ui.get_layer(buf)
+  if not layer then
+    return vim.NIL
+  end
+  local cursor = api.nvim_win_get_cursor(0)
+  local lnum = cursor[1] - 1
+  local lineinfo = layer.get(lnum)
+  if not lineinfo or not lineinfo.item then
+    return vim.NIL
+  end
+  ---@type dap.Variable|dap.EvaluateResponse
+  local item = lineinfo.item
+  local loc = item.valueLocationReference or item.declarationLocationReference
+  if not loc then
+    return vim.NIL
+  end
+
+  ---@type dap.ErrorResponse?
+  local err
+  ---@type dap.LocationsResponse?
+  local result
+
+  ---@type dap.LocationsArguments
+  local args = {
+    locationReference = loc
+  }
+  lsession:request("locations", args, function(e, r)
+    err = e
+    result = r
+  end)
+  vim.wait(2000, function() return err ~= nil or result ~= nil end)
+  if result and result.source.path then
+    local match = {
+      name = item.name or item.result,
+      filename = result.source.path,
+      cmd = string.format([[/\%%%dl\%%%dc/]], result.line, result.column or 0)
+    }
+    return { match }
+  end
+  return {}
+end
+
 
 api.nvim_create_autocmd("ExitPre", {
   pattern = "*",
   group = api.nvim_create_augroup("dap.exit", { clear = true }),
   callback = function()
-    for _, s in pairs(sessions) do
+    ---@param s dap.Session
+    local function close_session(s)
+      s.adapter.options = {
+        disconnect_timeout_sec = 0.1
+      }
       if s.config.request == "attach" then
         s:disconnect({ terminateDebuggee = false })
       else
         terminate(s)
       end
     end
-    vim.wait(500, function()
+    for _, s in pairs(sessions) do
+      close_session(s)
+    end
+    vim.wait(5000, function()
       ---@diagnostic disable-next-line: redundant-return-value
       return session == nil and next(sessions) == nil
     end)

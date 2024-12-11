@@ -146,10 +146,11 @@ local function launch_external_terminal(env, terminal, args)
 end
 
 
----@param terminal_win_cmd string|fun():integer, integer?
+---@param terminal_win_cmd string|fun(config: dap.Configuration):(integer, integer?)
 ---@param filetype string
+---@param config dap.Configuration
 ---@return integer bufnr, integer? winnr
-local function create_terminal_buf(terminal_win_cmd, filetype)
+local function create_terminal_buf(terminal_win_cmd, filetype, config)
   local cur_win = api.nvim_get_current_win()
   if type(terminal_win_cmd) == "string" then
     api.nvim_command(terminal_win_cmd)
@@ -164,7 +165,7 @@ local function create_terminal_buf(terminal_win_cmd, filetype)
     return bufnr, win
   else
     assert(type(terminal_win_cmd) == "function", "terminal_win_cmd must be a string or a function")
-    return terminal_win_cmd()
+    return terminal_win_cmd(config)
   end
 end
 
@@ -186,7 +187,7 @@ do
       end
     end
     local terminal_win
-    buf, terminal_win = create_terminal_buf(win_cmd, filetype)
+    buf, terminal_win = create_terminal_buf(win_cmd, filetype, config)
     if terminal_win then
       if vim.fn.has('nvim-0.8') == 1 then
         -- older versions don't support the `win` key
@@ -946,6 +947,7 @@ do
         api.nvim_buf_attach(bufnr, false, { on_detach = remove_breakpoints })
       end
       local path = api.nvim_buf_get_name(bufnr)
+      ---@type dap.SetBreakpointsArguments
       local payload = {
         source = {
           path = path;
@@ -1207,7 +1209,7 @@ local function new_session(adapter, opts, handle)
     stopped_thread_id = nil,
     current_frame = nil,
     threads = {},
-    adapter = adapter,
+    adapter = vim.deepcopy(adapter),
     dirty = {},
     capabilities = {},
     filetype = opts.filetype or vim.bo.filetype,
@@ -1319,12 +1321,12 @@ function Session.pipe(adapter, opts, on_connect)
   local pipe = assert(uv.new_pipe(), "Must be able to create pipe")
   local session = new_session(adapter, opts or {}, pipe)
 
+  local session_adapter = session.adapter
+  ---@cast session_adapter dap.PipeAdapter
+  adapter = session_adapter
+
   if adapter.executable then
     if adapter.pipe == "${pipe}" then
-      -- don't mutate original adapter definition
-      adapter = vim.deepcopy(adapter)
-      session.adapter = adapter
-
       local filepath = os.tmpname()
       os.remove(filepath)
       session.on_close["dap.server_executable_pipe"] = function()
@@ -1373,15 +1375,18 @@ function Session.pipe(adapter, opts, on_connect)
 end
 
 
+---@param adapter dap.ServerAdapter
 function Session.connect(_, adapter, opts, on_connect)
   local client = assert(uv.new_tcp(), "Must be able to create TCP client")
   local session = new_session(adapter, opts or {}, client)
 
+  local session_adapter = session.adapter
+  ---@cast session_adapter dap.ServerAdapter
+  adapter = session_adapter
+
   if adapter.executable then
     if adapter.port == "${port}" then
       local port = get_free_port()
-      -- don't mutate original adapter definition
-      adapter = vim.deepcopy(adapter)
       session.adapter = adapter
       adapter.port = port
       if adapter.executable.args then
@@ -1473,12 +1478,7 @@ function Session.spawn(_, adapter, opts)
   local pid_or_err
   local closed = false
 
-  local function onexit(cb)
-    if closed then
-      return
-    end
-    cb = cb or function() end
-    closed = true
+  local function sigint(cb)
     if not handle or handle:is_closing() then
       cb()
       return
@@ -1502,6 +1502,21 @@ function Session.spawn(_, adapter, opts)
     end)
   end
 
+  local function onexit(cb)
+    if closed then
+      return
+    end
+    cb = cb or function() end
+    closed = true
+    if stdin:is_closing() then
+      sigint(cb)
+    else
+      stdin:close(function()
+        sigint(cb)
+      end)
+    end
+  end
+
   local options = adapter.options or {}
   local spawn_opts = {
     args = adapter.args;
@@ -1512,9 +1527,6 @@ function Session.spawn(_, adapter, opts)
   }
   local session
   handle, pid_or_err = uv.spawn(adapter.command, spawn_opts, function(code)
-    stdin:close()
-    stdout:close()
-    stderr:close()
     onexit()
     log.info('Process closed', pid_or_err)
     if code ~= 0 then
@@ -1537,13 +1549,20 @@ function Session.spawn(_, adapter, opts)
   end
   session = new_session(adapter, opts or {}, stdin)
   session.client.close = onexit
-  stdout:read_start(rpc.create_read_loop(vim.schedule_wrap(function(body)
+
+  local function on_body(body)
     session:handle_body(body)
-  end)))
+  end
+  local function on_eof()
+    stdout:close()
+  end
+  stdout:read_start(rpc.create_read_loop(vim.schedule_wrap(on_body), on_eof))
   stderr:read_start(function(err, chunk)
     assert(not err, err)
     if chunk then
       log.error("stderr", adapter, chunk)
+    else
+      stderr:close()
     end
   end)
   return session
@@ -1815,21 +1834,11 @@ end
 ---@param config dap.Configuration
 function Session:initialize(config)
   vim.schedule(repl.clear)
-  local adapter_responded = false
   self.config = config
-  self:request('initialize', {
-    clientID = 'neovim';
-    clientName = 'neovim';
-    adapterID = self.adapter.id or 'nvim-dap';
-    pathFormat = 'path';
-    columnsStartAt1 = true;
-    linesStartAt1 = true;
-    supportsRunInTerminalRequest = true;
-    supportsVariableType = true;
-    supportsProgressReporting = true,
-    supportsStartDebuggingRequest = true,
-    locale = os.getenv('LANG') or 'en_US';
-  }, function(err0, result)
+  local adapter_responded = false
+
+  ---@param result dap.Capabilities?
+  local function on_initialize(err0, result)
     if err0 then
       utils.notify('Could not initialize debug adapter: ' .. utils.fmt_error(err0), vim.log.levels.ERROR)
       adapter_responded = true
@@ -1843,7 +1852,21 @@ function Session:initialize(config)
         self:close()
       end
     end)
-  end)
+  end
+  local params = {
+    clientID = 'neovim';
+    clientName = 'neovim';
+    adapterID = self.adapter.id or 'nvim-dap';
+    pathFormat = 'path';
+    columnsStartAt1 = true;
+    linesStartAt1 = true;
+    supportsRunInTerminalRequest = true;
+    supportsVariableType = true;
+    supportsProgressReporting = true,
+    supportsStartDebuggingRequest = true,
+    locale = os.getenv('LANG') or 'en_US';
+  }
+  self:request('initialize', params, on_initialize)
   local adapter = self.adapter
   local sec_to_wait = (adapter.options or {}).initialize_timeout_sec or 4
   local timer = assert(uv.new_timer(), "Must be able to create timer")
@@ -1970,7 +1993,7 @@ end
 
 ---@param event dap.ContinuedEvent
 function Session:event_continued(event)
-  if event.allThreadsContinued then
+  if event.allThreadsContinued == nil or event.allThreadsContinued == true then
     for _, t in pairs(self.threads) do
       t.stopped = false
     end
