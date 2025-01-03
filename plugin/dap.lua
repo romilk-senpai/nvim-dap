@@ -15,9 +15,10 @@ cmd('DapSetLogLevel',
     end
   }
 )
-cmd('DapShowLog', 'split | e ' .. vim.fn.stdpath('cache') .. '/dap.log | normal! G', {})
+cmd('DapShowLog', function() require("dap._cmds").show_logs() end, { nargs = 0 })
 cmd('DapContinue', function() require('dap').continue() end, { nargs = 0 })
 cmd('DapToggleBreakpoint', function() require('dap').toggle_breakpoint() end, { nargs = 0 })
+cmd('DapClearBreakpoints', function() require('dap').clear_breakpoints() end, { nargs = 0 })
 cmd('DapToggleRepl', function() require('dap.repl').toggle() end, { nargs = 0 })
 cmd('DapStepOver', function() require('dap').step_over() end, { nargs = 0 })
 cmd('DapStepInto', function() require('dap').step_into() end, { nargs = 0 })

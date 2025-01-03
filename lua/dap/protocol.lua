@@ -1,10 +1,8 @@
 ---@meta
 
-
 ---@class dap.ProtocolMessage
 ---@field seq number
 ---@field type "request"|"response"|"event"|string
-
 
 ---@class dap.Request: dap.ProtocolMessage
 ---@field type "request"
@@ -297,6 +295,7 @@
 ---@field instructionReference? string
 ---@field offset? number
 
+---@class dap.InitializedEvent
 
 ---@class dap.StoppedEvent
 ---@field reason "step"|"breakpoint"|"exception"|"pause"|"entry"|"goto"|"function breakpoint"|"data breakpoint"|"instruction breakpoint"|string;
