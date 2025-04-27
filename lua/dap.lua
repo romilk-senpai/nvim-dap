@@ -90,7 +90,7 @@ M.repl = setmetatable({}, {
 ---@field exceptionInfo table<string, dap.RequestListener>
 ---@field goto table<string, dap.RequestListener>
 ---@field gotoTargets table<string, dap.RequestListener>
----@field initialize table<string, dap.RequestListener>
+---@field initialize table<string, dap.RequestListener<dap.Capabilities?, dap.InitializeRequestArguments>>
 ---@field launch table<string, dap.RequestListener>
 ---@field loadedSources table<string, dap.RequestListener>
 ---@field modules table<string, dap.RequestListener>
@@ -262,6 +262,7 @@ M.adapters = {}
 ---@field type string
 ---@field request "launch"|"attach"
 ---@field name string
+---@field [string] any
 
 
 --- Configurations per adapter. See `:help dap-configuration` for more help.
@@ -296,7 +297,7 @@ end
 
 
 providers.configs["dap.global"] = function(bufnr)
-  local filetype = vim.bo[bufnr].filetype
+  local filetype = vim.b["dap-srcft"] or vim.bo[bufnr].filetype
   local configurations = M.configurations[filetype] or {}
   assert(
     islist(configurations),
@@ -311,7 +312,12 @@ end
 
 providers.configs["dap.launch.json"] = function()
   local ok, configs = pcall(require("dap.ext.vscode").getconfigs)
-  return ok and configs or {}
+  if not ok then
+    local msg = "Can't get configurations from launch.json:\n%s" .. configs
+    vim.notify_once(msg, vim.log.levels.WARN, {title = "DAP"})
+    return {}
+  end
+  return configs
 end
 
 do

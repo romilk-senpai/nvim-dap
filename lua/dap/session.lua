@@ -16,7 +16,7 @@ local mime_to_filetype = {
 
 local err_mt = {
   __tostring = function(e)
-    return utils.fmt_error(e)
+    return utils.fmt_error(e) or "Undefined error"
   end,
 }
 
@@ -155,19 +155,13 @@ end
 
 
 ---@param terminal_win_cmd string|fun(config: dap.Configuration):(integer, integer?)
----@param filetype string
 ---@param config dap.Configuration
 ---@return integer bufnr, integer? winnr
-local function create_terminal_buf(terminal_win_cmd, filetype, config)
+local function create_terminal_buf(terminal_win_cmd, config)
   local cur_win = api.nvim_get_current_win()
   if type(terminal_win_cmd) == "string" then
     api.nvim_command(terminal_win_cmd)
     local bufnr = api.nvim_get_current_buf()
-    if vim.filetype then
-      local path = vim.filetype.get_option(filetype, "path")
-      assert(type(path) == "string", "path option must be a string")
-      vim.bo[bufnr].path = path
-    end
     local win = api.nvim_get_current_win()
     api.nvim_set_current_win(cur_win)
     return bufnr, win
@@ -195,7 +189,17 @@ do
       end
     end
     local terminal_win
-    buf, terminal_win = create_terminal_buf(win_cmd, filetype, config)
+    local prev_buf = api.nvim_get_current_buf()
+    buf, terminal_win = create_terminal_buf(win_cmd, config)
+    assert(buf, "terminal_win_cmd must return a buffer number")
+    vim.bo[buf].errorformat = vim.bo[prev_buf].errorformat
+    if vim.filetype then
+      local path = vim.filetype.get_option(filetype, "path")
+      assert(type(path) == "string", "path option must be a string")
+      vim.bo[buf].path = path
+    else
+      vim.bo[buf].path = vim.bo[prev_buf].path
+    end
     if terminal_win then
       if vim.fn.has('nvim-0.8') == 1 then
         -- older versions don't support the `win` key
@@ -247,53 +251,34 @@ local function run_in_terminal(lsession, request)
     lsession.config,
     lsession.filetype
   )
-  local terminal_buf_name = '[dap-terminal] ' .. (lsession.config.name or body.args[1])
-  local terminal_name_ok = pcall(api.nvim_buf_set_name, terminal_buf, terminal_buf_name)
-  if not terminal_name_ok then
-    log:warn(terminal_buf_name ..  ' is not a valid buffer name')
-    api.nvim_buf_set_name(terminal_buf, '[dap-terminal] dap-' .. tostring(lsession.id))
-  end
   pcall(api.nvim_buf_del_keymap, terminal_buf, "t", "<CR>")
   local path = vim.bo[cur_buf].path
   if path and path ~= "" then
     vim.bo[terminal_buf].path = path
   end
-  local jobid
 
-  local chan = api.nvim_open_term(terminal_buf, {
-    on_input = function(_, _, _, data)
-      pcall(api.nvim_chan_send, jobid, data)
-    end,
-  })
-  local opts = {
-    env = next(body.env or {}) and body.env or vim.empty_dict(),
-    cwd = (body.cwd and body.cwd ~= '') and body.cwd or nil,
-    height = terminal_win and api.nvim_win_get_height(terminal_win) or 40,
-    width = terminal_win and api.nvim_win_get_width(terminal_win) or 80,
-    pty = true,
-    on_stdout = function(_, data)
-      local count = #data
-      for idx, line in pairs(data) do
-        if idx == count then
-          local send_ok = pcall(api.nvim_chan_send, chan, line)
-          if not send_ok then
-            return
-          end
-        else
-          local send_ok = pcall(api.nvim_chan_send, chan, line .. '\n')
-          if not send_ok then
-            return
-          end
-        end
+  local jobid
+  vim.api.nvim_buf_call(terminal_buf, function()
+    local termopen = vim.fn.has("nvim-0.11") == 1 and vim.fn.jobstart or vim.fn.termopen
+    jobid = termopen(body.args, {
+      env = next(body.env or {}) and body.env or vim.empty_dict(),
+      cwd = (body.cwd and body.cwd ~= '') and body.cwd or nil,
+      height = terminal_win and api.nvim_win_get_height(terminal_win) or math.ceil(vim.o.lines / 2),
+      width = terminal_win and api.nvim_win_get_width(terminal_win) or vim.o.columns,
+      term = vim.fn.has("nvim-0.11") == 1 and true or nil,
+      on_exit = function()
+        terminals.release(terminal_buf)
       end
-    end,
-    on_exit = function(_, exit_code)
-      pcall(api.nvim_chan_send, chan, '\r\n[Process exited ' .. tostring(exit_code) .. ']')
-      pcall(api.nvim_buf_set_keymap, terminal_buf, "t", "<CR>", "<cmd>bd!<CR>", { noremap = true, silent = true})
-      terminals.release(terminal_buf)
-    end,
-  }
-  jobid = vim.fn.jobstart(body.args, opts)
+    })
+  end)
+
+  local terminal_buf_name = "[dap-terminal] " .. (lsession.config.name or body.args[1])
+  local terminal_name_ok = pcall(api.nvim_buf_set_name, terminal_buf, terminal_buf_name)
+  if not terminal_name_ok then
+    log:warn(terminal_buf_name .. " is not a valid buffer name")
+    api.nvim_buf_set_name(terminal_buf, "[dap-terminal] dap-" .. tostring(lsession.id))
+  end
+
   if settings.focus_terminal then
     for _, win in pairs(api.nvim_tabpage_list_wins(0)) do
       if api.nvim_win_get_buf(win) == terminal_buf then
@@ -1090,7 +1075,7 @@ function Session:handle_body(body)
     vim.schedule(function()
       local before = listeners.before[decoded.command]
       call_listener(before, self, err, response, request, decoded.request_seq)
-      callback(err, decoded.body, decoded.request_seq)
+      callback(err, response, decoded.request_seq)
       local after = listeners.after[decoded.command]
       call_listener(after, self, err, response, request, decoded.request_seq)
     end)
@@ -1860,6 +1845,8 @@ end
 ---@return dap.ErrorResponse? err, any response # (if running in coroutine and on_response is empty)
 ---@overload fun(self: dap.Session, command: "evaluate", arguments: dap.EvaluateArguments, on_result: fun(err: dap.ErrorResponse?, result: dap.EvaluateResponse?)?):(dap.ErrorResponse?, dap.EvaluateResponse?)
 ---@overload fun(self: dap.Session, command: "variables", arguments: dap.VariablesArguments, on_result: fun(err: dap.ErrorResponse?, result: dap.VariableResponse?)?):(dap.ErrorResponse?, dap.VariableResponse?)
+---@overload fun(self: dap.Session, command: "threads", arguments: nil, on_result: fun(err: dap.ErrorResponse?, result: dap.ThreadResponse?)?):(dap.ErrorResponse?, dap.ThreadResponse?)
+---@overload fun(self: dap.Session, command: "stackTrace", arguments: dap.StackTraceArguments, on_result: fun(err: dap.ErrorResponse?, result: dap.StackTraceResponse?)?):(dap.ErrorResponse?, dap.StackTraceResponse?)
 function Session:request(command, arguments, on_result)
   local payload = {
     seq = self.seq,
